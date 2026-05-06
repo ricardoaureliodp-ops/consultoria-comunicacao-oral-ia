@@ -18,7 +18,6 @@ def chamar_gemini_audio(prompt, audio_bytes, mime_type, api_key):
     # Se um modelo retornar 503, o sistema tenta outro antes de avisar o aluno.
     modelos = [
         "gemini-2.5-flash",
-        "gemini-2.0-flash",
         "gemini-1.5-flash"
     ]
 
