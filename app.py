@@ -14,41 +14,70 @@ def chamar_gemini_audio(prompt, audio_bytes, mime_type, api_key):
     if not api_key:
         return "ERRO_API_KEY"
 
-    modelo = "gemini-2.5-flash"
-    url_chat = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent"
+    # Lista de modelos em ordem de preferência.
+    # Se um modelo retornar 503, o sistema tenta outro antes de avisar o aluno.
+    modelos = [
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash"
+    ]
 
     audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+    ultimo_erro = ""
 
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": prompt},
-                    {
-                        "inline_data": {
-                            "mime_type": mime_type,
-                            "data": audio_b64
+    for modelo in modelos:
+        url_chat = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent"
+
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": prompt},
+                        {
+                            "inline_data": {
+                                "mime_type": mime_type,
+                                "data": audio_b64
+                            }
                         }
-                    }
-                ]
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.35,
+                "topP": 0.9,
+                "maxOutputTokens": 2048
             }
-        ],
-        "generationConfig": {
-            "temperature": 0.4,
-            "topP": 0.9,
-            "maxOutputTokens": 2048
         }
-    }
 
-    try:
-        r = requests.post(url_chat, json=payload, headers={"x-goog-api-key": api_key, "Content-Type": "application/json"}, timeout=90)
-        if r.status_code == 200:
-            return r.json()["candidates"][0]["content"]["parts"][0]["text"]
-        if r.status_code == 503:
-            return "ERRO_503"
-        return f"ERRO_GEMINI_{r.status_code}: {r.text[:800]}"
-    except Exception as e:
-        return f"ERRO_CONEXAO: {e}"
+        try:
+            r = requests.post(
+                url_chat,
+                json=payload,
+                headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+                timeout=120
+            )
+
+            if r.status_code == 200:
+                dados = r.json()
+                try:
+                    return dados["candidates"][0]["content"]["parts"][0]["text"]
+                except Exception:
+                    return f"ERRO_GEMINI_RESPOSTA: {str(dados)[:800]}"
+
+            ultimo_erro = f"{modelo} => ERRO_GEMINI_{r.status_code}: {r.text[:800]}"
+
+            # 503 geralmente é sobrecarga temporária. Tenta o próximo modelo.
+            if r.status_code == 503:
+                continue
+
+            # Para outros erros, não adianta insistir muito.
+            return ultimo_erro
+
+        except Exception as e:
+            ultimo_erro = f"{modelo} => ERRO_CONEXAO: {e}"
+            continue
+
+    return f"ERRO_503: Todos os modelos testados retornaram falha ou sobrecarga. Último detalhe: {ultimo_erro}"
 
 # ---------- PLANILHA ----------
 def salvar_planilha(dados, webhook_url):
@@ -140,7 +169,7 @@ st.write("Atividade prática de oratória, clareza, postura profissional e comun
 api_key = st.secrets.get("GEMINI_API_KEY", "")
 webhook_url = st.secrets.get("SHEETS_WEBHOOK_URL", "")
 
-# Modelo atual usado na análise de áudio: gemini-2.5-flash
+# Modelos usados na análise de áudio: gemini-2.5-flash com fallback para gemini-2.0-flash e gemini-1.5-flash
 
 # ---------- SESSION STATE ----------
 if "indice_caso" not in st.session_state: st.session_state.indice_caso = 0
@@ -164,7 +193,7 @@ with st.sidebar:
         if confirmar_reinicio:
             if st.button("🔄 Reiniciar atividade"):
                 st.session_state.clear()
-                st.rerun()
+            st.rerun()
 
 if not nome:
     st.warning("👈 Digite seu nome na barra lateral para começar.")
@@ -250,7 +279,9 @@ if not st.session_state.caso_finalizado:
 
     if gravacao and gravacao.get("bytes"):
         audio_bytes = gravacao["bytes"]
-        mime_type = "audio/wav"
+        mime_type = gravacao.get("mime_type") or gravacao.get("type") or "audio/wav"
+        if mime_type == "audio/webm;codecs=opus":
+            mime_type = "audio/webm"
 
         st.success("Áudio gravado. Ouça antes de enviar.")
         st.audio(audio_bytes, format=mime_type)
@@ -276,9 +307,12 @@ if not st.session_state.caso_finalizado:
                 st.warning("Então apague esta gravação e faça outra antes de enviar.")
                 st.stop()
 
-            st.info("⏳ Envio recebido. A Consultoria Fala Mestre está analisando seu áudio. Aguarde sem atualizar a página.")
-            with st.spinner("Analisando áudio... isso pode levar alguns segundos."):
-                prompt = f"""
+            aviso_envio = st.empty()
+            status_box = st.empty()
+            aviso_envio.info("⏳ Envio recebido. A Consultoria Fala Mestre está analisando seu áudio. Aguarde sem atualizar a página.")
+            status_box.info("🔎 Analisando áudio... isso pode levar alguns segundos. Se a IA estiver cheia, o sistema tentará outro modelo automaticamente.")
+
+            prompt = f"""
 Você é um especialista em oratória e comunicação empresarial.
 Avalie o áudio de um aluno de Técnico em Administração em uma atividade de comunicação oral profissional.
 
@@ -361,26 +395,29 @@ Status: Satisfatório
 Status: Precisa melhorar
 Status: Encerrado com orientação
 """
-                feedback = chamar_gemini_audio(prompt, audio_bytes, mime_type, api_key)
+            feedback = chamar_gemini_audio(prompt, audio_bytes, mime_type, api_key)
+            status_box.empty()
 
-                if feedback in ["ERRO_503"] or feedback.startswith("ERRO_CONEXAO") or feedback.startswith("ERRO_GEMINI"):
-                    st.error("⚠️ A IA não conseguiu analisar agora ou ocorreu falha de conexão.")
-                    st.info("Não atualize a página. Sua gravação continua disponível. Clique novamente em **Enviar áudio para análise da Consultoria Fala Mestre**. Esta tentativa não foi registrada, não foi salva na planilha e não contou como tentativa.")
-                    with st.expander("Detalhe técnico para o professor"):
-                        st.code(feedback)
-                    st.stop()
+            if feedback in ["ERRO_503"] or feedback.startswith("ERRO_503") or feedback.startswith("ERRO_CONEXAO") or feedback.startswith("ERRO_GEMINI"):
+                aviso_envio.empty()
+                st.error("⚠️ A IA não conseguiu analisar agora ou ocorreu falha de conexão.")
+                st.info("Não atualize a página. Sua gravação continua disponível. Clique novamente em **Enviar áudio para análise da Consultoria Fala Mestre**. Esta tentativa não foi registrada, não foi salva na planilha e não contou como tentativa.")
+                st.warning("Para o aluno: aguarde alguns segundos e clique novamente no botão de envio. Se persistir, avise o professor, mas não apague o áudio.")
+                with st.expander("Detalhe técnico para o professor"):
+                    st.code(feedback)
+                st.stop()
 
-                if feedback == "ERRO_API_KEY":
-                    st.error("Erro: chave do Gemini não configurada corretamente nos Secrets.")
-                    st.stop()
+            if feedback == "ERRO_API_KEY":
+                st.error("Erro: chave do Gemini não configurada corretamente nos Secrets.")
+                st.stop()
 
-                st.session_state.ultimo_feedback = feedback
-                st.subheader("📋 Retorno da Consultoria Fala Mestre")
-                st.write(feedback)
+            st.session_state.ultimo_feedback = feedback
+            st.subheader("📋 Retorno da Consultoria Fala Mestre")
+            st.write(feedback)
 
-                status = detectar_status(feedback, st.session_state.tentativa)
+            status = detectar_status(feedback, st.session_state.tentativa)
 
-                dados = {
+            dados = {
                     "data_hora": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
                     "nome": nome,
                     "turma": turma,
@@ -393,25 +430,25 @@ Status: Encerrado com orientação
                     "status": status
                 }
 
-                salvou = salvar_planilha(dados, webhook_url)
-                if salvou:
-                    st.success("Resposta salva na planilha.")
-                else:
-                    st.error("Erro ao salvar na planilha. Verifique o webhook nos Secrets ou o Apps Script.")
+            salvou = salvar_planilha(dados, webhook_url)
+            if salvou:
+                st.success("Resposta salva na planilha.")
+            else:
+                st.error("Erro ao salvar na planilha. Verifique o webhook nos Secrets ou o Apps Script.")
 
-                if status == "Satisfatório":
-                    st.session_state.caso_finalizado = True
-                    st.success("✅ Resposta satisfatória. Clique em **Próximo caso** para continuar.")
-                    st.rerun()
-                elif st.session_state.tentativa >= 3:
-                    st.session_state.caso_finalizado = True
-                    st.warning("📌 Este caso foi encerrado com orientação. Clique em **Próximo caso** para continuar.")
-                    st.rerun()
-                else:
-                    st.session_state.tentativa += 1
-                    st.session_state.audio_key += 1
-                    st.warning("Use o feedback recebido para gravar uma nova tentativa.")
-                    st.rerun()
+            if status == "Satisfatório":
+                st.session_state.caso_finalizado = True
+                st.success("✅ Resposta satisfatória. Clique em **Próximo caso** para continuar.")
+                st.rerun()
+            elif st.session_state.tentativa >= 3:
+                st.session_state.caso_finalizado = True
+                st.warning("📌 Este caso foi encerrado com orientação. Clique em **Próximo caso** para continuar.")
+                st.rerun()
+            else:
+                st.session_state.tentativa += 1
+                st.session_state.audio_key += 1
+                st.warning("Use o feedback recebido para gravar uma nova tentativa.")
+                st.rerun()
     else:
         st.info("Grave seu áudio para liberar o envio à Consultoria Fala Mestre.")
 
