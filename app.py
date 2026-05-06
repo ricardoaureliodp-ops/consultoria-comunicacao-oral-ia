@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import base64
 from datetime import datetime
+from streamlit_mic_recorder import mic_recorder
 
 # =========================================================
 # CONSULTORIA IA - COMUNICAÇÃO ORAL PROFISSIONAL
@@ -151,12 +152,17 @@ if "audio_key" not in st.session_state: st.session_state.audio_key = 0
 with st.sidebar:
     st.header("👤 Identificação")
     nome = st.text_input("Nome do aluno:")
-    turma = st.text_input("Turma / Unidade:", value="")
+    turma = st.text_input("Turma:", value="")
     st.divider()
     st.write("🎧 Antes de enviar, ouça seu áudio. Se não gostar, apague e grave novamente.")
-    if st.button("🔄 Reiniciar atividade"):
-        st.session_state.clear()
-        st.rerun()
+
+    with st.expander("⚙️ Opções avançadas"):
+        st.warning("Use esta opção somente se precisar começar tudo de novo.")
+        confirmar_reinicio = st.checkbox("Entendo que vou perder o progresso desta atividade.")
+        if confirmar_reinicio:
+            if st.button("🔄 Reiniciar atividade"):
+                st.session_state.clear()
+                st.rerun()
 
 if not nome:
     st.warning("👈 Digite seu nome na barra lateral para começar.")
@@ -230,15 +236,19 @@ if not st.session_state.caso_finalizado:
 
     st.caption("Permita o uso do microfone no navegador. Depois de gravar, ouça o áudio antes de enviar.")
 
-    audio_file = st.audio_input(
-        "Clique para gravar sua resposta oral:",
-        key=f"audio_{st.session_state.indice_caso}_{st.session_state.tentativa}_{st.session_state.audio_key}",
-        sample_rate=16000
+    st.info("Use os botões abaixo para iniciar e parar a gravação. Depois, ouça seu áudio antes de enviar.")
+
+    gravacao = mic_recorder(
+        start_prompt="🎙️ Iniciar gravação",
+        stop_prompt="⏹️ Parar gravação",
+        just_once=False,
+        use_container_width=True,
+        key=f"mic_{st.session_state.indice_caso}_{st.session_state.tentativa}_{st.session_state.audio_key}"
     )
 
-    if audio_file is not None:
-        audio_bytes = audio_file.getvalue()
-        mime_type = audio_file.type or "audio/wav"
+    if gravacao and gravacao.get("bytes"):
+        audio_bytes = gravacao["bytes"]
+        mime_type = "audio/wav"
 
         st.success("Áudio gravado. Ouça antes de enviar.")
         st.audio(audio_bytes, format=mime_type)
