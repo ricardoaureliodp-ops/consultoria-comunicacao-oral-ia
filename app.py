@@ -10,22 +10,64 @@ from streamlit_mic_recorder import mic_recorder
 # =========================================================
 
 # ---------- GEMINI ----------
+def obter_modelos_disponiveis(api_key):
+    """Consulta os modelos liberados para a chave do usuário.
+    Isso evita erro quando um modelo antigo deixa de existir ou não está disponível na conta.
+    """
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+        r = requests.get(url, timeout=20)
+        if r.status_code != 200:
+            return []
+
+        modelos_api = r.json().get("models", [])
+        nomes = []
+        for m in modelos_api:
+            nome = m.get("name", "")
+            metodos = m.get("supportedGenerationMethods", [])
+            if nome and "generateContent" in metodos:
+                nomes.append(nome)
+        return nomes
+    except Exception:
+        return []
+
+
+def escolher_modelos(api_key):
+    """Prioriza modelos atuais da família 2.5 e nunca usa modelos 1.5/2.0 antigos."""
+    disponiveis = obter_modelos_disponiveis(api_key)
+
+    preferencias = [
+        "models/gemini-2.5-flash",
+        "models/gemini-2.5-flash-lite",
+    ]
+
+    escolhidos = [m for m in preferencias if m in disponiveis]
+
+    # Plano B: qualquer modelo 2.5 Flash disponível com generateContent, exceto TTS/Live/Image.
+    for m in disponiveis:
+        nome = m.lower()
+        if ("gemini-2.5" in nome and "flash" in nome
+                and "tts" not in nome and "live" not in nome and "image" not in nome):
+            if m not in escolhidos:
+                escolhidos.append(m)
+
+    # Último recurso: tenta o modelo oficial atual mesmo se a listagem falhar.
+    if not escolhidos:
+        escolhidos = ["models/gemini-2.5-flash"]
+
+    return escolhidos
+
+
 def chamar_gemini_audio(prompt, audio_bytes, mime_type, api_key):
     if not api_key:
         return "ERRO_API_KEY"
 
-    # Lista de modelos em ordem de preferência.
-    # Se um modelo retornar 503, o sistema tenta outro antes de avisar o aluno.
-    modelos = [
-        "gemini-2.5-flash",
-        "gemini-1.5-flash"
-    ]
-
+    modelos = escolher_modelos(api_key)
     audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
     ultimo_erro = ""
 
     for modelo in modelos:
-        url_chat = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent"
+        url_chat = f"https://generativelanguage.googleapis.com/v1beta/{modelo}:generateContent"
 
         payload = {
             "contents": [
@@ -65,18 +107,21 @@ def chamar_gemini_audio(prompt, audio_bytes, mime_type, api_key):
 
             ultimo_erro = f"{modelo} => ERRO_GEMINI_{r.status_code}: {r.text[:800]}"
 
-            # 503 geralmente é sobrecarga temporária. Tenta o próximo modelo.
-            if r.status_code == 503:
+            # 503/429 são falhas temporárias. Tenta outro modelo atual, se houver.
+            if r.status_code in [429, 500, 502, 503, 504]:
                 continue
 
-            # Para outros erros, não adianta insistir muito.
+            # Em 404, tenta o próximo modelo da lista atual.
+            if r.status_code == 404:
+                continue
+
             return ultimo_erro
 
         except Exception as e:
             ultimo_erro = f"{modelo} => ERRO_CONEXAO: {e}"
             continue
 
-    return f"ERRO_503: Todos os modelos testados retornaram falha ou sobrecarga. Último detalhe: {ultimo_erro}"
+    return f"ERRO_GEMINI: Não foi possível analisar o áudio com os modelos disponíveis. Detalhe: {ultimo_erro}"
 
 # ---------- PLANILHA ----------
 def salvar_planilha(dados, webhook_url):
@@ -454,8 +499,8 @@ Status: Encerrado com orientação
 # ---------- ÚLTIMO FEEDBACK ----------
 if st.session_state.ultimo_feedback:
     st.divider()
-    st.subheader("🧾 Último retorno recebido")
-    st.write(st.session_state.ultimo_feedback)
+    with st.expander("🧾 Último retorno técnico do professor"):
+        st.write(st.session_state.ultimo_feedback)
 
 # ---------- PRÓXIMO CASO ----------
 if st.session_state.caso_finalizado:
