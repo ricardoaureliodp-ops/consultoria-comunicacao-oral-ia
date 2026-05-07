@@ -5,513 +5,508 @@ from datetime import datetime
 from streamlit_mic_recorder import mic_recorder
 
 # =========================================================
-# CONSULTORIA FALA MESTRE - COMUNICAÇÃO ORAL PROFISSIONAL
+# CONSULTORIA FALA BONITO - COMUNICAÇÃO ORAL PROFISSIONAL
 # Streamlit + Gemini API + Google Sheets via Apps Script
 # =========================================================
 
-# ---------- GEMINI ----------
-def obter_modelos_disponiveis(api_key):
-    """Consulta os modelos liberados para a chave do usuário.
-    Isso evita erro quando um modelo antigo deixa de existir ou não está disponível na conta.
-    """
+st.set_page_config(
+    page_title="Consultoria Fala Bonito",
+    page_icon="🎤",
+    layout="wide"
+)
+
+# -------------------- CONFIG --------------------
+MAX_TENTATIVAS = 2
+
+def get_secret(*names):
+    for name in names:
+        try:
+            value = st.secrets.get(name)
+            if value:
+                return value
+        except Exception:
+            pass
+    return ""
+
+api_key = get_secret("GEMINI_API_KEY")
+webhook_url = get_secret("SHEETS_WEBHOOK_URL", "WEBHOOK_URL")
+
+# -------------------- GEMINI --------------------
+def listar_modelos_disponiveis(api_key):
+    """Busca modelos disponíveis para a chave e prioriza modelos Gemini 2.5."""
+    if not api_key:
+        return []
+
     try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
-        r = requests.get(url, timeout=20)
+        r = requests.get(url, timeout=15)
         if r.status_code != 200:
             return []
 
-        modelos_api = r.json().get("models", [])
-        nomes = []
-        for m in modelos_api:
+        modelos = []
+        for m in r.json().get("models", []):
             nome = m.get("name", "")
             metodos = m.get("supportedGenerationMethods", [])
-            if nome and "generateContent" in metodos:
-                nomes.append(nome)
-        return nomes
+            if "generateContent" in metodos and "gemini" in nome:
+                modelos.append(nome)
+
+        prioridade = []
+        for preferido in [
+            "models/gemini-2.5-flash",
+            "models/gemini-2.5-flash-lite",
+            "models/gemini-2.5-pro",
+        ]:
+            if preferido in modelos:
+                prioridade.append(preferido)
+
+        # Evita modelos antigos que deram erro/indisponibilidade.
+        restantes = [
+            m for m in modelos
+            if m not in prioridade
+            and "gemini-1.5" not in m
+            and "gemini-2.0" not in m
+        ]
+
+        return prioridade + restantes
     except Exception:
         return []
-
-
-def escolher_modelos(api_key):
-    """Prioriza modelos atuais da família 2.5 e nunca usa modelos 1.5/2.0 antigos."""
-    disponiveis = obter_modelos_disponiveis(api_key)
-
-    preferencias = [
-        "models/gemini-2.5-flash",
-        "models/gemini-2.5-flash-lite",
-    ]
-
-    escolhidos = [m for m in preferencias if m in disponiveis]
-
-    # Plano B: qualquer modelo 2.5 Flash disponível com generateContent, exceto TTS/Live/Image.
-    for m in disponiveis:
-        nome = m.lower()
-        if ("gemini-2.5" in nome and "flash" in nome
-                and "tts" not in nome and "live" not in nome and "image" not in nome):
-            if m not in escolhidos:
-                escolhidos.append(m)
-
-    # Último recurso: tenta o modelo oficial atual mesmo se a listagem falhar.
-    if not escolhidos:
-        escolhidos = ["models/gemini-2.5-flash"]
-
-    return escolhidos
 
 
 def chamar_gemini_audio(prompt, audio_bytes, mime_type, api_key):
     if not api_key:
         return "ERRO_API_KEY"
 
-    modelos = escolher_modelos(api_key)
+    modelos = listar_modelos_disponiveis(api_key)
+    if not modelos:
+        modelos = ["models/gemini-2.5-flash"]
+
     audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
-    ultimo_erro = ""
+    erros = []
 
-    for modelo in modelos:
-        url_chat = f"https://generativelanguage.googleapis.com/v1beta/{modelo}:generateContent"
-
-        payload = {
-            "contents": [
-                {
-                    "parts": [
-                        {"text": prompt},
-                        {
-                            "inline_data": {
-                                "mime_type": mime_type,
-                                "data": audio_b64
-                            }
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt},
+                    {
+                        "inline_data": {
+                            "mime_type": mime_type or "audio/wav",
+                            "data": audio_b64
                         }
-                    ]
-                }
-            ],
-            "generationConfig": {
-                "temperature": 0.35,
-                "topP": 0.9,
-                "maxOutputTokens": 2048
+                    }
+                ]
             }
+        ],
+        "generationConfig": {
+            "temperature": 0.2,
+            "topP": 0.8,
+            "maxOutputTokens": 900
         }
+    }
+
+    for modelo in modelos[:4]:
+        url_chat = f"https://generativelanguage.googleapis.com/v1beta/{modelo}:generateContent?key={api_key}"
 
         try:
             r = requests.post(
                 url_chat,
                 json=payload,
-                headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
-                timeout=120
+                headers={"Content-Type": "application/json"},
+                timeout=55
             )
 
             if r.status_code == 200:
-                dados = r.json()
+                data = r.json()
                 try:
-                    return dados["candidates"][0]["content"]["parts"][0]["text"]
+                    texto = data["candidates"][0]["content"]["parts"][0]["text"]
+                    if texto and texto.strip():
+                        return texto.strip()
                 except Exception:
-                    return f"ERRO_GEMINI_RESPOSTA: {str(dados)[:800]}"
+                    erros.append(f"{modelo} => resposta sem texto")
+                    continue
 
-            ultimo_erro = f"{modelo} => ERRO_GEMINI_{r.status_code}: {r.text[:800]}"
-
-            # 503/429 são falhas temporárias. Tenta outro modelo atual, se houver.
-            if r.status_code in [429, 500, 502, 503, 504]:
+            if r.status_code == 503:
+                erros.append(f"{modelo} => ERRO_503")
                 continue
 
-            # Em 404, tenta o próximo modelo da lista atual.
-            if r.status_code == 404:
-                continue
-
-            return ultimo_erro
+            erros.append(f"{modelo} => ERRO_GEMINI_{r.status_code}: {r.text[:600]}")
 
         except Exception as e:
-            ultimo_erro = f"{modelo} => ERRO_CONEXAO: {e}"
-            continue
+            erros.append(f"{modelo} => ERRO_CONEXAO: {e}")
 
-    return f"ERRO_GEMINI: Não foi possível analisar o áudio com os modelos disponíveis. Detalhe: {ultimo_erro}"
+    return "ERRO_GEMINI: " + " | ".join(erros)
 
-# ---------- PLANILHA ----------
+
+# -------------------- PLANILHA --------------------
 def salvar_planilha(dados, webhook_url):
     if not webhook_url:
         return False
     try:
         resposta = requests.post(webhook_url, json=dados, timeout=20)
         return resposta.status_code == 200
-    except:
+    except Exception:
         return False
 
-# ---------- STATUS ----------
+
+# -------------------- STATUS --------------------
 def detectar_status(feedback, tentativa):
-    texto = feedback.lower().replace(" ", "").replace("\n", "").replace("*", "")
-    if "status:satisfatório" in texto or "status:-satisfatório" in texto:
+    texto = (feedback or "").lower()
+    texto_limpo = texto.replace(" ", "").replace("\n", "").replace("-", "")
+
+    if "status:satisfatório" in texto_limpo or "status:satisfatorio" in texto_limpo:
         return "Satisfatório"
-    if "status:encerradocomorientação" in texto or "status:-encerradocomorientação" in texto:
+
+    if "pode avançar" in texto or "pode seguir" in texto or "próximo caso" in texto:
+        return "Satisfatório"
+
+    if tentativa >= MAX_TENTATIVAS:
         return "Encerrado com orientação"
-    if tentativa >= 3:
-        return "Encerrado com orientação"
+
     return "Precisa melhorar"
 
-# ---------- CASOS ----------
+
+# -------------------- CASOS --------------------
 casos = [
     {
         "nome": "Caso 1 - Apresentação Profissional",
-        "contexto": "Imagine que você está iniciando uma reunião corporativa ou uma pequena palestra profissional.",
-        "tarefa": "Faça uma breve apresentação pessoal. Fale seu nome, sua área de interesse, uma experiência ou objetivo profissional e finalize cumprimentando o público.",
+        "contexto": "Imagine que você está iniciando uma reunião corporativa ou uma pequena apresentação profissional.",
+        "tarefa": (
+            "Faça uma breve apresentação pessoal. Fale seu nome, sua área de atuação, "
+            "experiências ou cargos que já exerceu, o motivo da reunião ou apresentação "
+            "e finalize com uma saudação ao público."
+        ),
         "tempo": "Tempo sugerido: mínimo de 30 segundos e máximo de 1 minuto.",
-        "foco": "Clareza, naturalidade, organização básica da fala, postura profissional e fechamento adequado.",
-        "dicas": [
-            "Comece com uma saudação profissional.",
-            "Apresente-se de forma simples e segura.",
-            "Evite excesso de 'né', 'tipo', 'tá' e 'então'.",
-            "Finalize com uma frase de fechamento."
-        ]
+        "avaliacao": "Clareza, organização, postura profissional, objetividade e saudação adequada.",
+        "exemplo": (
+            "Boa tarde a todos. Meu nome é Ricardo, atuo na área administrativa e já tive experiência "
+            "com atendimento, organização de documentos e apoio em processos internos. O objetivo desta "
+            "reunião é apresentar uma proposta de melhoria para nossa rotina de trabalho. Agradeço a presença "
+            "de todos e espero contribuir com uma conversa produtiva."
+        )
     },
     {
-        "nome": "Caso 2 - Feedback Assertivo",
-        "contexto": "Você é responsável por orientar um colaborador que cometeu um erro administrativo recorrente.",
-        "tarefa": "Grave um áudio dando um feedback firme, respeitoso e empático. Explique o problema, mostre o impacto e direcione uma melhoria.",
-        "tempo": "Tempo sugerido: mínimo de 45 segundos e máximo de 1 minuto e 30 segundos.",
-        "foco": "Tom firme sem agressividade, comunicação não violenta, clareza na orientação e foco na solução.",
-        "dicas": [
-            "Não acuse a pessoa.",
-            "Fale sobre o comportamento ou erro, não sobre o caráter do colaborador.",
-            "Mostre consequência prática do erro.",
-            "Termine combinando uma ação de melhoria."
-        ]
-    },
-    {
-        "nome": "Caso 3 - Gestão de Crise",
-        "contexto": "Um cliente VIP está insatisfeito por causa de um atraso crítico na entrega de um serviço.",
-        "tarefa": "Grave uma resposta profissional pedindo desculpas, explicando a situação com cuidado e mostrando o encaminhamento da solução.",
-        "tempo": "Tempo sugerido: mínimo de 45 segundos e máximo de 1 minuto e 30 segundos.",
-        "foco": "Empatia, naturalidade, uso de pausas, respeito, objetividade e segurança na condução do problema.",
-        "dicas": [
-            "Assuma o problema sem criar desculpas excessivas.",
-            "Use tom respeitoso e calmo.",
-            "Explique o próximo passo com clareza.",
-            "Demonstre compromisso com a solução."
-        ]
-    },
-    {
-        "nome": "Caso 4 - Discurso de Persuasão",
-        "contexto": "Você está em uma reunião com seu superior e precisa defender um aumento de orçamento para seu setor.",
-        "tarefa": "Grave um discurso curto justificando o pedido com argumentos profissionais, como eficiência, melhoria de resultados, redução de falhas ou retorno sobre investimento.",
-        "tempo": "Tempo sugerido: mínimo de 1 minuto e máximo de 2 minutos.",
-        "foco": "Argumentação racional, credibilidade, entonação, objetividade e capacidade de convencer sem impor.",
-        "dicas": [
-            "Apresente o pedido logo no início.",
-            "Use até 3 argumentos principais.",
-            "Evite tom de exigência.",
-            "Conclua reforçando o benefício para a organização."
-        ]
+        "nome": "Caso 2 - Cliente Insatisfeito",
+        "contexto": "Um cliente entrou em contato insatisfeito por causa de atraso na entrega de um serviço.",
+        "tarefa": (
+            "Grave uma resposta profissional para esse cliente. Demonstre empatia, explique a situação "
+            "sem colocar culpa em outras pessoas, apresente uma solução ou encaminhamento e finalize "
+            "transmitindo confiança."
+        ),
+        "tempo": "Tempo sugerido: mínimo de 40 segundos e máximo de 1 minuto e 30 segundos.",
+        "avaliacao": "Empatia, clareza, controle emocional, objetividade, solução e tom profissional.",
+        "exemplo": (
+            "Senhor cliente, entendo sua insatisfação e peço desculpas pelo transtorno. Tivemos um atraso "
+            "no processo de entrega, mas já estamos verificando a situação para resolver o quanto antes. "
+            "A previsão é retornar com uma posição atualizada ainda hoje. Agradeço sua compreensão e reforço "
+            "que estamos acompanhando o caso com prioridade."
+        )
     }
 ]
 
-# ---------- CONFIGURAÇÃO STREAMLIT ----------
-st.set_page_config(
-    page_title="Consultoria Fala Mestre - Comunicação Oral",
-    page_icon="🎤",
-    layout="wide"
-)
 
-st.title("🎤 Consultoria Fala Mestre - Comunicação Oral Profissional")
-st.write("Atividade prática de oratória, clareza, postura profissional e comunicação empresarial com feedback de IA.")
+# -------------------- PROMPT --------------------
+def montar_prompt(caso, nome, tentativa, autoavaliacao):
+    precisa_exemplo = tentativa >= MAX_TENTATIVAS
 
-api_key = st.secrets.get("GEMINI_API_KEY", "")
-webhook_url = st.secrets.get("SHEETS_WEBHOOK_URL", "")
+    return f"""
+Você é a Consultoria Fala Bonito, uma consultoria bem-humorada, objetiva e profissional de comunicação oral.
+Avalie o áudio de um aluno de Técnico em Administração.
 
-# Modelos usados na análise de áudio: gemini-2.5-flash com fallback para gemini-2.0-flash e gemini-1.5-flash
+IMPORTANTE:
+- Seja breve, claro e útil.
+- Não faça textos longos.
+- Não use relatório grande.
+- Não humilhe o aluno.
+- Foque no que ele precisa melhorar para a próxima gravação.
+- Avalie a comunicação oral profissional, não apenas o conteúdo.
+- Se o áudio estiver vazio, inaudível ou fora da tarefa, informe isso com educação.
 
-# ---------- SESSION STATE ----------
-if "indice_caso" not in st.session_state: st.session_state.indice_caso = 0
-if "tentativa" not in st.session_state: st.session_state.tentativa = 1
-if "ultimo_feedback" not in st.session_state: st.session_state.ultimo_feedback = ""
-if "caso_finalizado" not in st.session_state: st.session_state.caso_finalizado = False
-if "atividade_finalizada" not in st.session_state: st.session_state.atividade_finalizada = False
-if "audio_key" not in st.session_state: st.session_state.audio_key = 0
+DADOS:
+Aluno: {nome}
+Caso: {caso['nome']}
+Contexto: {caso['contexto']}
+Tarefa esperada: {caso['tarefa']}
+Tempo recomendado: {caso['tempo']}
+Foco de avaliação: {caso['avaliacao']}
+Tentativa atual: {tentativa} de {MAX_TENTATIVAS}
+Autoavaliação do aluno: {autoavaliacao}
 
-# ---------- SIDEBAR ----------
+CRITÉRIOS:
+- Clareza da mensagem
+- Organização com começo, meio e fim
+- Linguagem profissional
+- Objetividade
+- Naturalidade, ritmo e pausas
+- Adequação ao contexto
+
+FORMATO OBRIGATÓRIO DA RESPOSTA:
+Use exatamente estes blocos, com frases curtas:
+
+Resumo da fala:
+- Escreva em até 2 linhas o que o aluno disse.
+
+Pontos positivos:
+- Liste até 3 pontos positivos.
+
+O que melhorar:
+- Liste até 3 melhorias, explicando rapidamente o motivo.
+
+Dica prática:
+- Dê 1 orientação objetiva para a próxima gravação.
+
+{"Exemplo curto de fala profissional:" if precisa_exemplo else ""}
+{("- Traga obrigatoriamente um exemplo curto que o aluno possa usar como referência, mesmo que seja genérico para o caso. Exemplo-base: " + caso['exemplo']) if precisa_exemplo else ""}
+
+Status:
+- Escreva apenas uma das opções:
+Status: Satisfatório
+Status: Precisa melhorar
+Status: Encerrado com orientação
+
+REGRA DE STATUS:
+- Se a fala cumprir o mínimo do caso com clareza e profissionalismo, use Status: Satisfatório.
+- Se for tentativa 1 e ainda precisar melhorar, use Status: Precisa melhorar.
+- Se for tentativa 2 e ainda precisar melhorar, use Status: Encerrado com orientação e traga o exemplo curto.
+"""
+
+
+# -------------------- SESSION STATE --------------------
+defaults = {
+    "indice_caso": 0,
+    "tentativa": 1,
+    "ultimo_feedback": "",
+    "ultimo_erro": "",
+    "caso_finalizado": False,
+    "atividade_finalizada": False,
+    "audio_bytes": None,
+    "audio_mime": "audio/wav",
+    "autoavaliacao": "Razoável",
+    "processando": False,
+}
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+
+# -------------------- SIDEBAR --------------------
 with st.sidebar:
     st.header("👤 Identificação")
     nome = st.text_input("Nome do aluno:")
-    turma = st.text_input("Turma:", value="")
+
     st.divider()
-    st.write("🎧 Antes de enviar, ouça seu áudio. Se não gostar, apague e grave novamente.")
+    st.info("🎧 Antes de enviar, ouça seu áudio. Se não gostar, apague e grave novamente.")
 
     with st.expander("⚙️ Opções avançadas"):
-        st.warning("Use esta opção somente se precisar começar tudo de novo.")
-        confirmar_reinicio = st.checkbox("Entendo que vou perder o progresso desta atividade.")
-        if confirmar_reinicio:
-            if st.button("🔄 Reiniciar atividade"):
+        confirmar = st.checkbox("Confirmo que quero apagar todo o progresso desta atividade.")
+        if st.button("🔄 Reiniciar atividade"):
+            if confirmar:
                 st.session_state.clear()
-            st.rerun()
+                st.rerun()
+            else:
+                st.warning("Marque a confirmação antes de reiniciar.")
+
+
+# -------------------- HEADER --------------------
+st.title("🎤 Consultoria Fala Bonito - Comunicação Oral Profissional")
+st.write("Atividade prática de oratória, clareza, postura profissional e comunicação empresarial com feedback de IA.")
 
 if not nome:
     st.warning("👈 Digite seu nome na barra lateral para começar.")
     st.stop()
 
+
 total_casos = len(casos)
 
 if st.session_state.atividade_finalizada:
-    st.success("🎉 Parabéns! Você concluiu todos os casos da atividade.")
+    st.success("🎉 Parabéns! Você concluiu os dois casos da atividade.")
     st.info("Suas respostas foram registradas na planilha.")
     st.stop()
 
 caso = casos[st.session_state.indice_caso]
 
-# ---------- PROGRESSO ----------
 st.progress(st.session_state.indice_caso / total_casos)
 st.write(f"### Progresso: Caso {st.session_state.indice_caso + 1} de {total_casos}")
 
-# ---------- EXPLICAÇÃO GERAL ----------
-with st.expander("📘 Orientações gerais da atividade", expanded=(st.session_state.indice_caso == 0 and st.session_state.tentativa == 1)):
+with st.expander("ℹ️ Orientações gerais da atividade", expanded=False):
     st.write("""
-Nesta atividade, você vai treinar comunicação oral profissional.  
-A proposta não é falar perfeito, mas melhorar sua clareza, organização, postura e segurança.
+Nesta atividade, você vai treinar comunicação oral profissional.
 
-A IA vai avaliar sua fala com base em critérios de comunicação empresarial:
-- clareza da mensagem;
-- estrutura com início, meio e fim;
-- postura profissional;
-- objetividade;
-- ritmo, pausas e naturalidade;
-- uso adequado da linguagem;
-- conexão com o público.
-""")
-    st.info("Você poderá ouvir o áudio antes de enviar. Só envie quando considerar que a gravação ficou adequada.")
+A proposta não é falar perfeito. A proposta é melhorar clareza, organização, postura e segurança.
 
-# ---------- CASO ----------
+Antes de gravar:
+- organize começo, meio e fim;
+- fale com calma;
+- evite excesso de “né”, “tipo”, “tá” e “então”;
+- finalize com uma mensagem clara;
+- ouça seu áudio antes de enviar.
+    """)
+
 st.subheader(f"📚 {caso['nome']}")
 st.info(caso["contexto"])
 
 col_a, col_b = st.columns([2, 1])
+
 with col_a:
-    st.markdown("### 🎯 Sua tarefa")
+    st.write("### 🎯 Sua tarefa")
     st.write(caso["tarefa"])
     st.warning(caso["tempo"])
-    st.markdown("### 🔎 Foco da avaliação")
-    st.write(caso["foco"])
+
+    st.write("### 🔎 Foco da avaliação")
+    st.write(caso["avaliacao"])
 
 with col_b:
-    st.markdown("### ✅ Checklist antes de gravar")
-    for d in caso["dicas"]:
-        st.write(f"✔️ {d}")
-    st.write("✔️ Organize sua fala com início, meio e fim.")
-    st.write("✔️ Use pausas e fale com calma.")
-    st.write("✔️ Conclua com uma mensagem clara.")
+    st.write("### ✅ Checklist antes de gravar")
+    checklist = [
+        "Comece com uma saudação profissional.",
+        "Organize sua fala com começo, meio e fim.",
+        "Evite vícios de linguagem em excesso.",
+        "Fale com calma e clareza.",
+        "Use pausas curtas.",
+        "Finalize com uma mensagem objetiva."
+    ]
+    for item in checklist:
+        st.write(f"✔️ {item}")
 
-st.write(f"### Tentativa atual: {st.session_state.tentativa} de 3")
+
+st.write(f"## Tentativa atual: {st.session_state.tentativa} de {MAX_TENTATIVAS}")
 
 if st.session_state.caso_finalizado:
-    st.success("✅ Este caso foi encerrado. Clique em **Próximo caso** para continuar.")
-elif st.session_state.tentativa == 1:
-    st.info("🟢 Primeira tentativa: grave sua fala com clareza e profissionalismo.")
-elif st.session_state.tentativa == 2:
-    st.warning("🟡 Segunda tentativa: use o feedback anterior para melhorar. A IA ainda não dará exemplo pronto.")
-elif st.session_state.tentativa == 3:
-    st.error("🔴 Terceira tentativa: se ainda não estiver adequado, a IA dará um exemplo recomendado e encerrará o caso.")
+    st.success("✅ Este caso foi encerrado. Leia o feedback e clique em **Próximo caso** quando estiver pronto.")
+else:
+    if st.session_state.tentativa == 1:
+        st.info("🟢 Primeira tentativa: grave sua fala com clareza e profissionalismo.")
+    else:
+        st.warning("🟡 Segunda tentativa: use o feedback anterior para melhorar. Se ainda não atingir o mínimo, a consultoria trará um exemplo.")
 
-# ---------- ÁUDIO ----------
+
+# -------------------- AUDIO --------------------
 if not st.session_state.caso_finalizado:
     st.divider()
     st.subheader("🎙️ Gravação do áudio")
-
     st.caption("Permita o uso do microfone no navegador. Depois de gravar, ouça o áudio antes de enviar.")
-
     st.info("Use os botões abaixo para iniciar e parar a gravação. Depois, ouça seu áudio antes de enviar.")
 
-    gravacao = mic_recorder(
+    audio = mic_recorder(
         start_prompt="🎙️ Iniciar gravação",
         stop_prompt="⏹️ Parar gravação",
         just_once=False,
         use_container_width=True,
-        key=f"mic_{st.session_state.indice_caso}_{st.session_state.tentativa}_{st.session_state.audio_key}"
+        key=f"gravador_{st.session_state.indice_caso}_{st.session_state.tentativa}"
     )
 
-    if gravacao and gravacao.get("bytes"):
-        audio_bytes = gravacao["bytes"]
-        mime_type = gravacao.get("mime_type") or gravacao.get("type") or "audio/wav"
-        if mime_type == "audio/webm;codecs=opus":
-            mime_type = "audio/webm"
-
+    if audio and isinstance(audio, dict) and audio.get("bytes"):
+        st.session_state.audio_bytes = audio.get("bytes")
+        st.session_state.audio_mime = audio.get("mime_type") or "audio/wav"
         st.success("Áudio gravado. Ouça antes de enviar.")
-        st.audio(audio_bytes, format=mime_type)
 
-        autoavaliacao = st.radio(
-            "Antes de enviar, como você avalia sua própria fala?",
+    if st.session_state.audio_bytes:
+        st.audio(st.session_state.audio_bytes, format=st.session_state.audio_mime)
+
+        st.write("Antes de enviar, como você avalia sua própria fala?")
+        st.session_state.autoavaliacao = st.radio(
+            "Autoavaliação:",
             ["Muito nervoso(a)", "Razoável", "Confiante", "Ainda quero refazer"],
-            horizontal=True
+            horizontal=True,
+            label_visibility="collapsed",
+            index=["Muito nervoso(a)", "Razoável", "Confiante", "Ainda quero refazer"].index(st.session_state.autoavaliacao)
+            if st.session_state.autoavaliacao in ["Muito nervoso(a)", "Razoável", "Confiante", "Ainda quero refazer"] else 1
         )
 
         col1, col2 = st.columns([1, 1])
-        with col1:
-            apagar = st.button("🗑️ Apagar e gravar novamente")
-        with col2:
-            enviar = st.button("📩 Enviar áudio para análise da Consultoria Fala Mestre")
 
-        if apagar:
-            st.session_state.audio_key += 1
-            st.rerun()
+        with col1:
+            if st.button("🗑️ Apagar e gravar novamente"):
+                st.session_state.audio_bytes = None
+                st.session_state.ultimo_erro = ""
+                st.rerun()
+
+        with col2:
+            enviar = st.button("📩 Enviar áudio para análise da Consultoria Fala Bonito", type="primary")
 
         if enviar:
-            if autoavaliacao == "Ainda quero refazer":
-                st.warning("Então apague esta gravação e faça outra antes de enviar.")
+            if st.session_state.autoavaliacao == "Ainda quero refazer":
+                st.warning("Você marcou que ainda quer refazer. Apague e grave novamente antes de enviar.")
                 st.stop()
 
-            aviso_envio = st.empty()
-            status_box = st.empty()
-            aviso_envio.info("⏳ Envio recebido. A Consultoria Fala Mestre está analisando seu áudio. Aguarde sem atualizar a página.")
-            status_box.info("🔎 Analisando áudio... isso pode levar alguns segundos. Se a IA estiver cheia, o sistema tentará outro modelo automaticamente.")
+            st.info("⏳ Envio recebido. A Consultoria Fala Bonito está analisando seu áudio. Aguarde sem atualizar a página.")
 
-            prompt = f"""
-Você é um especialista em oratória e comunicação empresarial.
-Avalie o áudio de um aluno de Técnico em Administração em uma atividade de comunicação oral profissional.
+            with st.spinner("Analisando áudio... isso pode levar alguns segundos."):
+                prompt = montar_prompt(caso, nome, st.session_state.tentativa, st.session_state.autoavaliacao)
+                feedback = chamar_gemini_audio(
+                    prompt,
+                    st.session_state.audio_bytes,
+                    st.session_state.audio_mime,
+                    api_key
+                )
 
-IMPORTANTE:
-- Seja técnico, educativo, acolhedor e respeitoso.
-- Não humilhe nem ridicularize o aluno.
-- Nervosismo não deve ser tratado como fracasso; oriente como melhorar.
-- Avalie a comunicação oral, não a personalidade do aluno.
-- Considere que o aluno está em processo de aprendizagem.
-
-CASO ATUAL:
-{caso['nome']}
-
-CONTEXTO:
-{caso['contexto']}
-
-TAREFA PEDIDA AO ALUNO:
-{caso['tarefa']}
-
-TEMPO SUGERIDO:
-{caso['tempo']}
-
-FOCO DA AVALIAÇÃO:
-{caso['foco']}
-
-TENTATIVA ATUAL:
-{st.session_state.tentativa}
-
-AUTOAVALIAÇÃO DO ALUNO:
-{autoavaliacao}
-
-CRITÉRIOS DE AVALIAÇÃO:
-1. Clareza: a mensagem foi fácil de entender?
-2. Estrutura: houve início, desenvolvimento e fechamento?
-3. Profissionalismo: a linguagem e o tom foram adequados ao ambiente corporativo?
-4. Objetividade: a fala foi direta, sem rodeios excessivos?
-5. Ritmo e naturalidade: a fala teve fluidez, pausas e ritmo adequado?
-6. Linguagem: houve excesso de vícios como "né", "tipo", "tá", "então", "ééé"?
-7. Conexão com o público: a fala gerou confiança, empatia ou interesse?
-8. Segurança comunicativa: a fala transmitiu calma e direção, mesmo com possível nervosismo?
-
-REGRAS PEDAGÓGICAS:
-- Nas tentativas 1 e 2, NÃO entregue resposta pronta nem roteiro completo.
-- Nas tentativas 1 e 2, dê orientação clara para o aluno melhorar no próximo envio.
-- Na tentativa 3, se ainda não estiver satisfatório, apresente um exemplo recomendado de fala.
-- Se o áudio estiver satisfatório, elogie de forma profissional e libere o avanço.
-- Se o áudio estiver muito curto, vazio, inaudível ou fora da proposta, explique o problema e oriente a refazer.
-- Sempre que possível, transcreva ou resuma a fala do aluno para registrar o conteúdo.
-
-FORMATO OBRIGATÓRIO DA RESPOSTA:
-
-Transcrição ou resumo da fala:
-- ...
-
-Pontos fortes:
-- ...
-
-Oportunidades de melhoria:
-- ...
-
-Notas visuais:
-- Clareza: X/5
-- Estrutura: X/5
-- Profissionalismo: X/5
-- Ritmo/Naturalidade: X/5
-- Objetividade: X/5
-
-Dica de ouro:
-- ...
-
-Orientação para o próximo envio:
-- ...
-
-Exemplo recomendado:
-- Preencher somente na tentativa 3 se ainda não estiver satisfatório. Nas tentativas 1 e 2 escreva: "Ainda não será apresentado exemplo pronto nesta tentativa."
-
-Status:
-- Escreva exatamente uma das opções:
-Status: Satisfatório
-Status: Precisa melhorar
-Status: Encerrado com orientação
-"""
-            feedback = chamar_gemini_audio(prompt, audio_bytes, mime_type, api_key)
-            status_box.empty()
-
-            if feedback in ["ERRO_503"] or feedback.startswith("ERRO_503") or feedback.startswith("ERRO_CONEXAO") or feedback.startswith("ERRO_GEMINI"):
-                aviso_envio.empty()
+            if feedback == "ERRO_API_KEY" or feedback.startswith("ERRO_GEMINI") or "ERRO_503" in feedback or "ERRO_CONEXAO" in feedback:
+                st.session_state.ultimo_erro = feedback
                 st.error("⚠️ A IA não conseguiu analisar agora ou ocorreu falha de conexão.")
-                st.info("Não atualize a página. Sua gravação continua disponível. Clique novamente em **Enviar áudio para análise da Consultoria Fala Mestre**. Esta tentativa não foi registrada, não foi salva na planilha e não contou como tentativa.")
-                st.warning("Para o aluno: aguarde alguns segundos e clique novamente no botão de envio. Se persistir, avise o professor, mas não apague o áudio.")
-                with st.expander("Detalhe técnico para o professor"):
+                st.info("Não atualize a página. Sua gravação continua disponível. Clique novamente em **Enviar áudio**. Esta tentativa não foi registrada, não foi salva na planilha e não contou como tentativa.")
+                with st.expander("🧾 Detalhe técnico para o professor"):
                     st.code(feedback)
                 st.stop()
 
-            if feedback == "ERRO_API_KEY":
-                st.error("Erro: chave do Gemini não configurada corretamente nos Secrets.")
-                st.stop()
-
             st.session_state.ultimo_feedback = feedback
-            st.subheader("📋 Retorno da Consultoria Fala Mestre")
-            st.write(feedback)
+            st.session_state.ultimo_erro = ""
 
             status = detectar_status(feedback, st.session_state.tentativa)
 
             dados = {
-                    "data_hora": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
-                    "nome": nome,
-                    "turma": turma,
-                    "caso": caso["nome"],
-                    "contexto": caso["contexto"],
-                    "tarefa": caso["tarefa"],
-                    "tentativa": st.session_state.tentativa,
-                    "autoavaliacao": autoavaliacao,
-                    "feedback_ia": feedback,
-                    "status": status
-                }
+                "data": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+                "nome": nome,
+                "caso": caso["nome"],
+                "tentativa": st.session_state.tentativa,
+                "feedback": feedback,
+                "status": status
+            }
 
             salvou = salvar_planilha(dados, webhook_url)
-            if salvou:
-                st.success("Resposta salva na planilha.")
-            else:
-                st.error("Erro ao salvar na planilha. Verifique o webhook nos Secrets ou o Apps Script.")
+            if not salvou:
+                st.warning("Feedback gerado, mas houve falha ao salvar na planilha. Verifique o Apps Script e a URL do webhook.")
 
             if status == "Satisfatório":
                 st.session_state.caso_finalizado = True
-                st.success("✅ Resposta satisfatória. Clique em **Próximo caso** para continuar.")
+                st.session_state.audio_bytes = None
+                st.success("✅ Resposta satisfatória. Leia o feedback e avance quando estiver pronto.")
                 st.rerun()
-            elif st.session_state.tentativa >= 3:
+
+            elif st.session_state.tentativa >= MAX_TENTATIVAS:
                 st.session_state.caso_finalizado = True
-                st.warning("📌 Este caso foi encerrado com orientação. Clique em **Próximo caso** para continuar.")
+                st.session_state.audio_bytes = None
+                st.warning("📌 Caso encerrado com orientação. Leia o feedback e avance quando estiver pronto.")
                 st.rerun()
+
             else:
                 st.session_state.tentativa += 1
-                st.session_state.audio_key += 1
+                st.session_state.audio_bytes = None
                 st.warning("Use o feedback recebido para gravar uma nova tentativa.")
                 st.rerun()
-    else:
-        st.info("Grave seu áudio para liberar o envio à Consultoria Fala Mestre.")
 
-# ---------- ÚLTIMO FEEDBACK ----------
+    else:
+        st.info("Grave seu áudio para liberar o envio à Consultoria Fala Bonito.")
+
+
+# -------------------- FEEDBACK --------------------
 if st.session_state.ultimo_feedback:
     st.divider()
-    with st.expander("🧾 Último retorno técnico do professor"):
-        st.write(st.session_state.ultimo_feedback)
+    st.subheader("📋 Retorno da Consultoria Fala Bonito")
+    st.write(st.session_state.ultimo_feedback)
 
-# ---------- PRÓXIMO CASO ----------
+
+# -------------------- PROXIMO CASO --------------------
 if st.session_state.caso_finalizado:
     st.divider()
+
     if st.session_state.indice_caso < total_casos - 1:
         if st.button("➡️ Próximo caso"):
             st.session_state.indice_caso += 1
             st.session_state.tentativa = 1
             st.session_state.ultimo_feedback = ""
+            st.session_state.ultimo_erro = ""
             st.session_state.caso_finalizado = False
-            st.session_state.audio_key += 1
+            st.session_state.audio_bytes = None
+            st.session_state.autoavaliacao = "Razoável"
             st.rerun()
     else:
         if st.button("🏁 Finalizar atividade"):
