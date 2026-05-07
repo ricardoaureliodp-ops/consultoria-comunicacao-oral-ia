@@ -387,6 +387,10 @@ if not st.session_state.caso_finalizado:
             st.info("⏳ Envio recebido. A Consultoria Fala Bonito está analisando seu áudio. Aguarde sem atualizar a página.")
 
             incluir_exemplo = st.session_state.tentativa == 2
+            bloco_exemplo = """
+Exemplo profissional curto:
+- traga um exemplo completo e curto, com 4 a 6 frases, adequado ao caso.
+""" if incluir_exemplo else ""
 
             prompt = f"""
 Você é a Consultoria Fala Bonito, especialista em comunicação oral profissional para alunos de Técnico em Administração.
@@ -444,7 +448,7 @@ O que melhorar:
 Dica prática:
 - uma dica objetiva para o próximo envio ou para a vida profissional.
 
-{"Exemplo profissional curto:\n- traga um exemplo completo e curto, com 4 a 6 frases, adequado ao caso." if incluir_exemplo else ""}
+{bloco_exemplo}
 
 Status:
 - escreva exatamente uma das opções:
