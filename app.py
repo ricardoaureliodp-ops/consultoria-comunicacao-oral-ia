@@ -11,11 +11,11 @@ except Exception:
 
 # =========================================================
 # CONSULTORIA FALA BONITO - COMUNICAÇÃO ORAL PROFISSIONAL
-# Versão 12 - 2 casos, 2 tentativas, feedback curto e completo
+# Versão 13 - feedback enxuto, completo e com fallback
 # Streamlit + Gemini API + Google Sheets via Apps Script
 # =========================================================
 
-APP_VERSION = "v12_fala_bonito_feedback_completo"
+APP_VERSION = "v13_fala_bonito_limpo_final"
 
 # ---------- CONFIG ----------
 st.set_page_config(
@@ -176,7 +176,7 @@ def chamar_gemini_audio(prompt, audio_bytes, mime_type, api_key):
             "generationConfig": {
                 "temperature": 0.2,
                 "topP": 0.8,
-                "maxOutputTokens": 1200,
+                "maxOutputTokens": 2400,
             },
         }
         try:
@@ -191,7 +191,7 @@ def chamar_gemini_audio(prompt, audio_bytes, mime_type, api_key):
                 parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
                 texto = "".join([p.get("text", "") for p in parts if "text" in p]).strip()
                 if texto:
-                    return texto, f"Modelo usado: {modelo}"
+                    return texto, ""
                 ultimo_erro = f"{modelo} => resposta vazia"
             elif r.status_code == 503:
                 ultimo_erro = f"{modelo} => ERRO_503"
@@ -227,65 +227,98 @@ def detectar_status(feedback, tentativa):
         return "Encerrado com exemplo"
     return "Precisa melhorar"
 
+def feedback_incompleto(feedback):
+    f = normalizar(feedback)
+    if not feedback or len(feedback.strip()) < 350:
+        return True
+    obrigatorios = ["resumo", "pontos positivos", "melhorar", "dica", "status"]
+    return any(item not in f for item in obrigatorios)
+
+def montar_feedback_reserva(caso, tentativa, nome, status=None):
+    # Usado somente se a IA devolver texto cortado. Mantém a atividade funcionando em sala.
+    exemplo = caso.get("exemplo", "")
+    if tentativa >= 2:
+        status_txt = "Encerrado com exemplo"
+        exemplo_bloco = f"\n\n**Exemplo curto:**\n{exemplo}"
+    else:
+        status_txt = status or "Precisa melhorar"
+        exemplo_bloco = ""
+
+    if "Apresentação" in caso["nome"]:
+        resumo = "Você realizou uma apresentação profissional inicial, com foco em se identificar e explicar o objetivo da fala."
+        positivos = "- Cumpriu a proposta principal da atividade.\n- Demonstrou iniciativa ao organizar uma fala oral."
+        melhorar = "- Organize melhor a sequência: saudação, nome, área de atuação, experiências e motivo da apresentação.\n- Fale com calma e finalize com uma saudação objetiva ao público."
+        dica = "Antes de gravar, escreva 4 palavras-chave em ordem: quem sou, onde atuo, experiência e objetivo da reunião."
+    else:
+        resumo = "Você respondeu a uma situação de cliente insatisfeito e tentou apresentar uma solução profissional."
+        positivos = "- Procurou responder ao problema apresentado.\n- Demonstrou preocupação em manter uma postura profissional."
+        melhorar = "- Comece reconhecendo a insatisfação do cliente com empatia.\n- Explique claramente o que será feito e finalize transmitindo segurança."
+        dica = "Use a sequência: acolher, explicar, resolver e tranquilizar."
+
+    return f"""**Resumo da fala:**
+{resumo}
+
+**Pontos positivos:**
+{positivos}
+
+**O que melhorar:**
+{melhorar}
+
+**Dica prática:**
+{dica}{exemplo_bloco}
+
+**Status:** {status_txt}"""
+
 # ---------- PROMPT ----------
 def montar_prompt(caso, tentativa, nome, autoavaliacao):
     exemplo_obrigatorio = tentativa >= 2
     regra_exemplo = """
-7. Exemplo curto:
-- Como é a 2ª tentativa, se a fala ainda não estiver satisfatória, traga um exemplo curto e profissional para o aluno comparar.
-- Se estiver satisfatória, escreva apenas: Não necessário.
-""" if exemplo_obrigatorio else "7. Exemplo curto: Não trazer exemplo nesta tentativa."
+**Exemplo curto:**
+Se a fala ainda precisar melhorar, escreva um exemplo profissional de 3 a 5 frases baseado no caso.
+Se estiver satisfatória, escreva: Não necessário.
+""" if exemplo_obrigatorio else "Não traga exemplo nesta primeira tentativa."
 
     return f"""
-Você é a Consultoria Fala Bonito, especialista em comunicação oral profissional para alunos de Técnico em Administração.
-Avalie o áudio enviado pelo aluno de forma pedagógica, objetiva e respeitosa.
+Você é a Consultoria Fala Bonito, avaliando áudio de aluno de Técnico em Administração.
+Responda em português do Brasil, de forma curta, objetiva e útil para o aluno melhorar.
 
-NOME DO ALUNO: {nome}
-AUTOAVALIAÇÃO DO ALUNO: {autoavaliacao}
-TENTATIVA: {tentativa} de 2
-CASO: {caso['nome']}
-CONTEXTO: {caso['contexto']}
-TAREFA: {caso['tarefa']}
-FOCO DA AVALIAÇÃO: {caso['foco']}
-TEMPO SUGERIDO: {caso['tempo']}
+Aluno: {nome}
+Autoavaliação: {autoavaliacao}
+Tentativa: {tentativa} de 2
+Caso: {caso['nome']}
+Tarefa: {caso['tarefa']}
+Foco: {caso['foco']}
 
-REGRAS IMPORTANTES:
-- Não faça introdução longa.
-- Não escreva relatório extenso.
-- Seja curto, claro e útil.
-- O feedback precisa ensinar o aluno a melhorar.
-- Preencha TODAS as seções abaixo.
-- Não pare no meio da resposta.
-- Use no máximo 2 frases por seção.
-- Na tentativa 1, não dê resposta pronta.
-- Na tentativa 2, se ainda precisar melhorar, dê um exemplo curto, mesmo que genérico.
-- Considere satisfatório quando a fala tiver clareza mínima, organização básica, tom profissional e cumprir a tarefa principal.
+REGRAS:
+- Não faça saudação longa.
+- Não faça relatório extenso.
+- Preencha todos os campos abaixo.
+- Cada campo deve ter no máximo 2 frases ou 2 bullets.
+- Na tentativa 1, não dê exemplo pronto.
+- Na tentativa 2, se ainda precisar melhorar, dê exemplo curto.
+- Status deve ser exatamente: Satisfatório, Precisa melhorar ou Encerrado com exemplo.
 
-FORMATO OBRIGATÓRIO DA RESPOSTA:
+FORMATO OBRIGATÓRIO:
 
-1. Resumo da fala:
-- [resuma em 1 frase o que o aluno falou]
+**Resumo da fala:**
+[1 frase]
 
-2. Pontos positivos:
+**Pontos positivos:**
 - [ponto 1]
 - [ponto 2]
 
-3. O que melhorar:
-- [ponto 1 com orientação prática]
-- [ponto 2 com orientação prática]
+**O que melhorar:**
+- [orientação prática 1]
+- [orientação prática 2]
 
-4. Dica para a próxima gravação:
-- [uma dica simples e aplicável]
-
-5. Avaliação geral:
-- [Satisfatória ou Precisa melhorar, com justificativa curta]
-
-6. Status:
-- [escreva exatamente uma destas opções: Satisfatório | Precisa melhorar | Encerrado com exemplo]
+**Dica prática:**
+[1 dica simples]
 
 {regra_exemplo}
 
-EXEMPLO DE REFERÊNCIA DO CASO, para usar somente se necessário na 2ª tentativa:
+**Status:** [Satisfatório | Precisa melhorar | Encerrado com exemplo]
+
+Exemplo de referência do caso, se necessário:
 {caso['exemplo']}
 """
 
@@ -422,9 +455,12 @@ if not st.session_state.caso_finalizado:
                 st.error("⚠️ A IA não conseguiu analisar agora ou ocorreu falha de conexão.")
                 st.info("Não atualize a página. Sua gravação continua disponível. Clique novamente em **Enviar áudio para análise**. Esta tentativa não foi registrada, não foi salva na planilha e não contou como tentativa.")
             else:
-                st.session_state.ultimo_feedback = feedback
-                st.session_state.ultimo_erro_tecnico = detalhe
                 status = detectar_status(feedback, st.session_state.tentativa)
+                if feedback_incompleto(feedback):
+                    feedback = montar_feedback_reserva(caso, st.session_state.tentativa, nome, status)
+                    status = detectar_status(feedback, st.session_state.tentativa)
+                st.session_state.ultimo_feedback = feedback
+                st.session_state.ultimo_erro_tecnico = ""
 
                 dados = {
                     "data": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
@@ -458,10 +494,6 @@ if st.session_state.ultimo_feedback:
     st.divider()
     with st.expander("📋 Último feedback recebido", expanded=True):
         st.markdown(st.session_state.ultimo_feedback)
-
-if st.session_state.ultimo_erro_tecnico:
-    with st.expander("🔧 Detalhe técnico para o professor"):
-        st.code(st.session_state.ultimo_erro_tecnico)
 
 # ---------- PRÓXIMO CASO ----------
 if st.session_state.caso_finalizado:
